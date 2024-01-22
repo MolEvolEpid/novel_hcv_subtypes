@@ -7,4 +7,4 @@ Repository contents:
 - `novel_hcv_sugtypes.html`: rendered Quarto file
 - `data`: directory containing the alignment and phylogeny used for analyses
 - `figures`: directory containing manuscript figures created by running the code in `novel_hcv_subtypes.qmd`
-- `simplot`: output from [SimPlot++](https://github.com/Stephane-S/Simplot_PlusPlus) analysis to search for signatures of recombination
+- `simplot`: directory containing output from [SimPlot++](https://github.com/Stephane-S/Simplot_PlusPlus) analysis to search for signatures of recombination
