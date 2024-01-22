@@ -4,7 +4,7 @@ Code and data from Mbisa et al. "Identification of two novel subtypes of hepatit
 
 Repository contents:
 - `novel_hcv_subtypes.qmd`: Quarto file containing the code used to perform all analyses
-- `novel_hcv_sugtypes.html`: rendered Quarto file
+- `novel_hcv_sugtypes.html`: rendered Quarto file; to view, download and open in a web browser
 - `data`: directory containing the alignment and phylogeny used for analyses
 - `figures`: directory containing manuscript figures created by running the code in `novel_hcv_subtypes.qmd`
 - `simplot`: directory containing output from [SimPlot++](https://github.com/Stephane-S/Simplot_PlusPlus) analysis to search for signatures of recombination
