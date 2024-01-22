@@ -1,0 +1,563 @@
+---
+title: "HCV subtype analysis"
+execute:
+  echo: false
+  message: false
+  warning: false
+format: html
+---
+
+```{r}
+# load libraries
+library(ape)
+library(tidyverse)
+library(igraph)
+library(ggtree)
+library(treeio)
+library(cowplot)
+library(overlapping)
+```
+
+### Versions
+
+```{r}
+# versions
+R.version$version.string
+packages <- c('ape', 'tidyverse', 'igraph', 'ggtree', 'treeio', 'cowplot', 'overlapping') 
+sapply(packages, function(x) as.character(packageVersion(x)))
+```
+
+
+```{r}
+# set plotting theme
+theme_set(theme_classic())
+
+# set genotype colors for plotting
+genotype_colors <- c('#3cb44b', '#ffe119', '#42d4f4', '#f58231', '#911eb4', 'deepskyblue3', '#bcf60c', 'red3')
+names(genotype_colors) <- 1:8
+
+# read in alignment
+# contains 238 HCV ref seqs from ICTV version 09.03.22 downloaded 10.24.23 plus our 3 new HCV taxa (first 3 seqs in ali)
+aln <- read.FASTA("data/hcv+ref.mafft.FFT-NS-i.trimends.fasta")
+
+# get sequence information
+seq_info <- names(aln) %>% 
+  enframe(value = 'id') %>% 
+  separate(id, sep = '_', into = c('genotype_subtype', 'unique_id'), remove = FALSE, ) %>% 
+  mutate(genotype_subtype = ifelse(grepl('Pt', genotype_subtype), NA, genotype_subtype),
+         # call genotype 4? genotype 4
+         genotype = gsub('[a-z]|\\?', '', genotype_subtype),
+         subtype = gsub('[0-9]|\\?', '', genotype_subtype)) %>%
+  select(-c(name, unique_id, genotype_subtype)) %>% 
+  suppressWarnings() # for Pt sequences it fills info in with NA which is what we want
+
+# read in tree
+tr <- read.iqtree('data/hcv+ref.PhyML.gtrig.trim.tree') %>% 
+  mutate(lab = ifelse(grepl('Pt', label), label, NA),
+         node_lab = ifelse(node %in% c(347:349, 353, 354), ifelse(SH_aLRT == 1, '*', NA), NA)) %>% 
+  left_join(seq_info %>% rename(label = id), by = 'label')
+```
+
+```{r}
+# Functions. see example input for functions in code below
+
+#' Compute normalized Hamming distances (substitutions/site) and assign pair types
+#'
+#' @param aln Alignment (DNAbin object, fasta file can be read in with ape::read.FASTA())
+#' @param mode "directed" (returns distances for, e.g., both A-B and B-A) or "undirected" (returns distance for, e.g., only A-B or B-A)
+#' @param seq_info Data frame with information on each sequence in the alignment including 3 columns named id, genotype, and subtype. For new sequences, the genotype and subtype should be NA. For reference genotypes with a known genotype and unknown subtype, the subtype should be an empty string (''). 
+#'
+#' @return Data frame with columns: seq1, seq2, dist, genotype_seq1, subtype_seq1, genotype_seq2, subtype_seq2, pair_type
+compute_hamming_dists <- function(aln, mode, seq_info){
+  # calculate pairwise genetic distances (normalized hamming, substitutions/site) and convert to long format
+  dist.dna(aln, model = "raw", pairwise.deletion = TRUE, as.matrix = TRUE) %>%
+    graph.adjacency(mode = mode, weighted = TRUE) %>% 
+    get.data.frame() %>% 
+    rename(seq1 = from, seq2 = to, dist = weight) %>% 
+    # add in sequence information
+    left_join(seq_info %>% rename(seq1 = id, genotype_seq1 = genotype, subtype_seq1 = subtype), by = 'seq1') %>% 
+    left_join(seq_info %>% rename(seq2 = id, genotype_seq2 = genotype, subtype_seq2 = subtype), by = 'seq2') %>% 
+    # determine the pair type
+    mutate(pair_type = case_when(is.na(genotype_seq1) & is.na(genotype_seq2) ~ 'Between Pt',
+                                 is.na(genotype_seq1) ~ paste0(seq1, ' and reference'),
+                                 is.na(genotype_seq2) ~ paste0(seq2, ' and reference'),
+                                 genotype_seq1 == genotype_seq2 & (subtype_seq1 == '' | subtype_seq2 == '') ~ 'Same genotype, unknown subtype',
+                                 genotype_seq1 == genotype_seq2 & subtype_seq1 == subtype_seq2 ~ 'Within subtype',
+                                 genotype_seq1 == genotype_seq2 ~ 'Between subtype',
+                                 genotype_seq1 != genotype_seq2 ~ 'Between genotype')) %>% 
+    as_tibble()
+}
+
+#' Get the overlap between pairwise distance distribution of closest genotype and other genotypes
+#'
+#' @param window_dat Merged data frames output by compute_hamming_dists() for each window that includes the window position in a pos column. No unknown (NA) genotype_seq2 rows are allowed
+#'
+#' @return Data frame with columns: seq1, pos, geno_min, overlap
+get_overlap <- function(window_dat){
+  window_dat %>% 
+    summarize(.by = c(seq1, pos),
+              geno_min = genotype_seq2[which.min(dist)],
+              dists_min = list(dist[genotype_seq2 == geno_min]),
+              dists_other = list(dist[genotype_seq2 != geno_min])) %>% 
+    rowwise() %>% 
+    mutate(overlap = overlap(list(unlist(dists_min), unlist(dists_other)), type = '2', boundaries = c(0, 1))$OV) %>% 
+    ungroup() %>% 
+    select(seq1, pos, geno_min, overlap)
+}
+```
+
+### HCV phylogeny
+
+```{r}
+# get most recent common ancestor for each genotype
+mrcas <- sapply(1:8, function(g){
+  geno_tips <- tr %>%
+    as_tibble() %>% 
+    filter(genotype == g) %>% 
+    pull(label)
+  MRCA(tr, geno_tips)
+})
+
+# plot tree colored by genotype
+(tr_plot <- groupClade(tr, mrcas) %>% 
+  as_tibble() %>% 
+  # don't color root branch of each genotype
+  mutate(group = case_when(node %in% c(331, 329, 281, 244, 479, 440, 354, 350) ~ factor(0), 
+                           TRUE ~ group)) %>%
+  as.treedata() %>%
+  ggtree(aes(col = group), layout = 'equal_angle') +
+    # label branches of interest that have high branch support and add text
+    geom_nodelab(aes(label = node_lab),
+                 nudge_x = c(0.02, 0.02, 0, 0, 0), nudge_y = c(0, 0, 0.002, -0.025, 0.0), # this throws a warning but it works
+                 show.legend = FALSE)  +
+    geom_text(label = '*aLRT = 1', x = 0.3, y = -0.65, col = 'grey50', check_overlap = TRUE)+
+    # label sequences of interest
+    geom_tiplab(aes(label = lab), offset = -0.01, size = 3, vjust = 0.2, col = 'black', show.legend = FALSE) +
+    # color genotypes
+    scale_color_manual(values = c(genotype_colors, 'white'), breaks = 1:8) +
+    labs(col = 'Genotype') +
+    # add scale bar and related text
+    geom_treescale(offset = 0.01, x = 0.25, y = -0.5, col = 'grey50') +
+    geom_text(label = '[subst/site]', x = 0.3, y = -0.53, col = 'grey50', check_overlap = TRUE)) 
+
+# save tree
+ggsave(plot = tr_plot, filename = 'figures/full_tr.pdf', width = 7, height = 7, dpi = 300)
+```
+
+### Whole-genome Hamming distances
+
+```{r}
+# calculate whole genome distances
+# undirected because we don't want pairs showing up twice in the distributions
+dists_whole_genome <- compute_hamming_dists(aln, mode = 'undirected', seq_info = seq_info)
+
+# get information about between patient pairs and prep data for plotting
+btwn_pt_dists <- dists_whole_genome %>% filter(pair_type == 'Between Pt') %>% 
+  mutate(pair_type = paste0(seq1, ' and ', seq2)) %>% 
+  mutate(pair_cat = factor('Reference', levels = c('Reference', 'Pt1', 'Pt2', 'Pt3')))
+
+# remove reference pairs with an unknown subtype and between patient pairs and prep data for plotting
+dists_sub <- dists_whole_genome %>% 
+  filter(!(pair_type %in% c('Same genotype, unknown subtype', 'Between Pt'))) %>% 
+  mutate(geno = case_when(grepl('Pt3', pair_type) & genotype_seq2 == 6 ~ genotype_seq2,
+                          grepl('Pt1|Pt2', pair_type) & genotype_seq2 == 8 ~ genotype_seq2,
+                          !grepl('Pt', pair_type) ~ 'Reference',
+                          TRUE ~ 'Other'),
+         pair_cat = ifelse(grepl('Pt', pair_type), gsub(' and reference', '', pair_type), 'Reference'),
+         pair_type = ifelse(grepl('Pt', pair_type), paste0('Patient and genotype ', geno), as.character(pair_type)),
+         pair_type = ifelse(pair_type == 'Patient and genotype Other', 'Patient and other genotype', pair_type),
+         pair_cat = factor(pair_cat, levels = c('Reference', 'Pt1', 'Pt2', 'Pt3')),
+         pair_type = factor(pair_type, levels = c('Between genotype', 'Between subtype', 
+                                                  'Within subtype', 'Patient and genotype 6', 
+                                                  'Patient and genotype 8', 'Patient and other genotype')))
+
+# plot whole-genome distances
+(dists_plot <- dists_sub %>%
+    # add information about where to plot labels and order them correctly
+    left_join(tibble(pair_cat = factor(levels(dists_sub$pair_cat), levels(dists_sub$pair_cat)), y = c(26, 350, 225, 60)), by = join_by(pair_cat)) %>%
+    ggplot(aes(x = dist, fill = pair_type, col = pair_type)) +
+    facet_grid(pair_cat~., scales = 'free') +
+    geom_density(alpha = 0.7) +
+    # add in between patient info
+    geom_point(data = btwn_pt_dists, aes(x = dist, shape = pair_type), y = 0, col = 'black', fill = 'black', size = 1) +
+    geom_text(aes(label = pair_cat, y = y), x = 0.007, col = 'black', check_overlap = TRUE, hjust = 0) +
+    scale_fill_manual(values = c(grey.colors(n = 3, start = 0.5, end = 0.9), 'deepskyblue3', 'red3', 'grey30')) +
+    scale_color_manual(values = c(grey.colors(n = 3, start = 0.5, end = 0.9), 'deepskyblue3', 'red3', 'grey30')) +
+    scale_shape_manual(values = c(8, 3, 4)) +
+    labs(col = 'Pair type', fill = 'Pair type', x = 'Hamming distance [subst/site]', y = 'Density', shape = 'Patient pair') +
+    theme(strip.text.y = element_blank()))
+```
+
+For each Pt, largest Wilcox p of all pairwise genetic distances among each Pt and reference sequences of a given genotype:
+
+```{r}
+# find nearest genotype to each sequence and collpase distances by sequence and genotype
+geno_dists_whole <- dists_sub %>%
+  # compare only for patients vs. references
+  filter(grepl('Pt', seq1) & !is.na(genotype_seq2)) %>% 
+  # get minimum genotype for each sequence
+  mutate(.by = seq1,
+         geno_min = genotype_seq2[which.min(dist)]) %>% 
+  # collapse distances by sequence and genotype
+  summarize(.by = c(seq1, genotype_seq2, geno_min),
+            geno_dists = list(dist))
+
+# compare of pairwise distances of each sequence to closest genotype vs. other genotypes
+lapply(unique(geno_dists_whole$seq1), function(p){
+    df <- geno_dists_whole %>% filter(seq1 == p) 
+    df_min <- df %>% filter(genotype_seq2 == geno_min) %>% rename(geno_dists_min = geno_dists) %>% select(-genotype_seq2)
+    df_other <- df %>% filter(genotype_seq2 != geno_min) %>% rename(geno_dists_other = geno_dists)
+    full_join(df_other, df_min, by = join_by(seq1, geno_min)) %>% 
+      rowwise() %>% 
+      mutate(wilcox_p = wilcox.test(geno_dists_min, geno_dists_other, alternative = 'less')$p.value) %>% 
+      ungroup()
+}) %>% 
+  bind_rows() %>% suppressWarnings() %>% 
+  # get maximum p-value for a given sequence across all genotypes
+  slice_max(by = seq1, wilcox_p, with_ties = FALSE) %>% 
+  select(seq1, wilcox_p)
+```
+
+### Sliding window Hamming distances
+
+```{r}
+# window size
+window_size <- 500
+# step size
+step_size <- 50 
+# sequence length
+n_nt <- length(aln$Pt1)
+# steps
+steps <- seq(1, n_nt, step_size)
+steps <- steps[steps + window_size < n_nt]
+
+# get pairwise distances for each window
+window_dists <- lapply(steps, function(x){
+  as.matrix(aln)[,x:(x+window_size)] %>% 
+    # directed because it's easier to get all distances for a given sequence this way
+    compute_hamming_dists(mode = 'directed', seq_info) %>% 
+    mutate(pos = x)
+}) %>% bind_rows() 
+
+# for analyses where we assume that Pt2 is genotype 8b, only for Pt comparisons
+window_dists_supp <- window_dists %>%
+  mutate(genotype_seq2 = ifelse(seq2 == 'Pt2', 8, genotype_seq2),
+         subtype_seq2 = ifelse(seq2 == 'Pt2', 'b', subtype_seq2)) %>%
+   filter(grepl('Pt', seq1) & !is.na(genotype_seq2))
+
+# 95% CIs for each reference pair type
+dist_ranges <- window_dists %>% 
+  filter(subtype_seq1 != '' & subtype_seq2 != '') %>% 
+  summarize(.by = c(pair_type, pos),
+            dist_q025 = quantile(dist, 0.025, na.rm = TRUE),
+            dist_q975 = quantile(dist, 0.975, na.rm = TRUE))
+
+# get overlap for Pt sequences
+geno_dists_compare_min <- window_dists %>%
+   filter(grepl('Pt', seq1) & !is.na(genotype_seq2)) %>% 
+  get_overlap()
+geno_dists_compare_min_supp <- window_dists_supp %>%
+  get_overlap()
+
+# get overlap for reference sequences (between subtype and between genotype)
+ref_window_overlap <- window_dists %>% 
+  filter(!grepl('Pt', seq1) & !grepl('Pt', seq2) & 
+           pair_type != 'Same genotype, unknown subtype' & pair_type != 'Within subtype') %>% 
+  summarize(.by = c(pos, pair_type),
+            dists = list(dist)) %>% 
+  pivot_wider(names_from = pair_type, values_from = dists) %>% 
+  rowwise() %>% 
+  mutate(ref_overlap = overlap(list(unlist(`Between genotype`), unlist(`Between subtype`)), type = '2', boundaries = c(0, 1))$OV) %>% 
+  ungroup() %>% 
+  select(pos, ref_overlap)
+
+# merge data together
+overlap_dat <- window_dists %>% 
+  filter(grepl('Pt', seq1) & !is.na(genotype_seq2)) %>% 
+  group_by(seq1, pos) %>% 
+  # get minimum distances and summarize
+  slice_min(dist) %>% 
+  summarize(genos = str_c(sort(unique(genotype_seq2)), collapse = ';'),
+            dist = unique(dist)) %>% 
+  ungroup() %>% 
+  # add in overlap
+  inner_join(geno_dists_compare_min) %>% 
+  mutate(type = 'Only reference sequences') %>% 
+  # add in Pt2 as genotype 8
+  bind_rows(window_dists_supp %>%
+  filter(grepl('Pt', seq1) & !is.na(genotype_seq2)) %>% 
+  group_by(seq1, pos) %>% 
+  slice_min(dist) %>% 
+  summarize(genos = str_c(sort(unique(genotype_seq2)), collapse = ';'),
+            dist = unique(dist)) %>% 
+  ungroup() %>% 
+  inner_join(geno_dists_compare_min_supp) %>% 
+  mutate(type = 'Pt2 sequence included as genotype 8')) %>% 
+    left_join(ref_window_overlap) %>% 
+  # determine whether genotype is confidently more closely related to nearest genotype than others
+  mutate(geno_orig = ifelse(genos %in% c(6, 8), genos, 'Other'),
+         geno = ifelse(overlap < ref_overlap, geno_orig, 'Uncertain'),
+         geno = factor(geno, levels = c('6', '8', 'Other', 'Uncertain'))) %>%
+  rowwise() %>% 
+  # determine whether minimum distance is in the 95% CI for between genotype, between subtype, within subtype
+  mutate(between_genotype_95 = case_when(
+    dist <= dist_ranges$dist_q975[dist_ranges$pos == pos & dist_ranges$pair_type == 'Between genotype'] & 
+      dist >= dist_ranges$dist_q025[dist_ranges$pos == pos & dist_ranges$pair_type == 'Between genotype'] ~ 'Between genotype 95% CI',
+    TRUE ~ 'Not between genotype 95% CI'),
+    between_subtype_95 = case_when(
+    dist <= dist_ranges$dist_q975[dist_ranges$pos == pos & dist_ranges$pair_type == 'Between subtype'] & 
+      dist >= dist_ranges$dist_q025[dist_ranges$pos == pos & dist_ranges$pair_type == 'Between subtype'] ~ 'Between subtype 95% CI',
+    TRUE ~ 'Not between subtype 95% CI'),
+    within_subtype_95 = case_when(
+    dist <= dist_ranges$dist_q975[dist_ranges$pos == pos & dist_ranges$pair_type == 'Within subtype'] & 
+      dist >= dist_ranges$dist_q025[dist_ranges$pos == pos & dist_ranges$pair_type == 'Within subtype'] ~ 'Within subtype 95% CI',
+    TRUE ~ 'Not within subtype 95% CI')) %>% 
+  ungroup()
+```
+
+```{r}
+# HCV gene positions for plotting
+aln_gene_pos <- tibble(name = c("5'UTR", "C", "E1", "E2", "P7", "NS2", "NS3", "NS4A", "NS4B", "NS5A", "NS5B", "3'UTR"),
+       start = c(1, 341, 914, 1490, 2579, 2768, 3418, 5311, 5473, 6256, 7603, 9379)) %>% 
+  mutate(stop = ifelse(is.na(lead(start)), length(aln[[1]]), lead(start)-1),
+         midpoint = start+(stop-start)/2,
+         lab = ifelse(name %in% c("C", "E1", "E2", "NS2", "NS3", "NS4B", "NS5A", "NS5B"), name, ''))
+
+# gene plot
+gene_plot <- bind_rows(aln_gene_pos %>% mutate(n = 1),
+                       aln_gene_pos %>% mutate(n = 2)) %>% 
+  ggplot(aes(xmin = start, xmax = stop, ymin = 0, ymax = 1, group = name, label = lab)) +
+  facet_grid(~n) +
+  geom_rect(col = 'white', fill = 'grey90') +
+  geom_text(aes(x = midpoint, y = 0.5), size = 2) +
+  theme_void() +
+  labs(y = 'HCV\ngenome:') +
+  theme(strip.text.x = element_blank(), 
+        panel.spacing.x = unit(1, 'lines'), 
+        axis.title.y = element_text(size = 8, hjust = 1),
+        plot.margin = margin(t = 0, r = 0, b = 3, l = 0, unit = "pt"))
+
+# plot distances by window
+window500_plot <- overlap_dat %>% 
+  mutate(related = ifelse(geno == 'Uncertain', NA, dist),
+         uncertain = ifelse(geno == 'Uncertain', dist, NA)) %>%
+  ggplot(aes(x = pos + window_size/2)) +
+  facet_grid(seq1~type) +
+  geom_ribbon(data = dist_ranges,
+              aes(ymin = dist_q025, ymax = dist_q975, fill = pair_type), alpha = 0.75) +
+  geom_point(aes(y = uncertain, group = seq1),
+             shape = 1, col = 'grey40', size = 1, alpha = 0.7, stroke = 0.4) +
+  geom_point(aes(y = related, col = geno, group = seq1, shape = geno), size = 1, alpha = 0.7) +
+  geom_text(aes(label = seq1), x = 100, y = 0.5, col = 'black', check_overlap = TRUE, hjust = 0) +
+  scale_fill_grey(start = 0.5, end = 0.9) +
+  scale_color_manual(values = c('deepskyblue3', 'red3', 'grey40', 'grey40')) +
+    scale_shape_manual(values = c(19, 19, 19, 1)) +
+  labs(x = 'Position', y = 'Hamming distance [subst/site]', col = 'Most closely\nrelated genotype', fill = '95% CI', 
+       shape = 'Most closely\nrelated genotype') + 
+  theme(strip.text.y = element_blank(), 
+        strip.background = element_blank(), 
+        strip.text.x = element_text(size = 12),
+        panel.spacing.x = unit(1, 'lines'))
+
+# plot windows and genes together
+(window500_plot <- plot_grid(window500_plot + 
+                              coord_cartesian(xlim = c(0, 10000)), 
+                   gene_plot + 
+                     coord_cartesian(xlim = c(0, 10000)), 
+                   align = 'v', axis = 'lr',
+          ncol = 1, rel_heights = c(20, 1)))
+
+# plot overlap by window
+overlap_plot <- overlap_dat %>% 
+  mutate(uncertain = ifelse(geno == 'Uncertain', 'gteq threshold', 'lt threshold')) %>%
+  ggplot(aes(x = pos + window_size/2, y = overlap, col = geno_orig, shape = uncertain)) +
+  facet_grid(seq1~type) +
+  geom_line(aes(y = ref_overlap, group = seq1, linetype = 'Between-subtype vs.\nbetween-genotype\nfor reference sequences'), col = 'grey') +
+  geom_point(size = 1, alpha = 0.7, stroke = 0.4) +
+  geom_text(aes(label = seq1), x = 100, y = 0.9, col = 'black', check_overlap = TRUE, hjust = 0) +
+  scale_fill_grey(start = 0.5, end = 0.9) +
+  scale_color_manual(values = c('deepskyblue3', 'red3', 'grey40', 'grey40')) +
+  scale_shape_manual(values = c(1, 19), labels = c(expression('' >= 'reference threshold'), expression('' < 'reference threshold'))) +
+  labs(x = 'Position', y = 'Proportion of overlap', 
+       col = 'Most closely\nrelated genotype', linetype = '', shape = '') + 
+  guides(col = guide_legend(order = 1),
+         shape = guide_legend(order = 3, title = element_blank()),
+         linetype = guide_legend(order = 2, title = element_blank())) +
+  theme(strip.text.y = element_blank(), 
+        strip.background = element_blank(), 
+        strip.text.x = element_text(size = 12),
+        panel.spacing.x = unit(1, 'lines')) +
+   coord_cartesian(ylim = c(0, 1), xlim = c(0, 10000))
+
+(overlap_plot <- plot_grid(overlap_plot, 
+                   gene_plot +
+                     coord_cartesian(xlim = c(0, 10000)), 
+                   align = 'v', axis = 'lr',
+          ncol = 1, rel_heights = c(20, 1)))
+```
+
+Proportion of windows that fell into the between subtype 95% CI for each Pt:
+
+```{r}
+overlap_dat %>% 
+  filter(type == 'Only reference sequences') %>% 
+  group_by(seq1, between_subtype_95) %>% 
+  tally() %>% 
+  group_by(seq1) %>% 
+  mutate(tot = sum(n),
+         prop = n/tot) %>% 
+  filter(between_subtype_95 == 'Between subtype 95% CI')
+```
+
+
+### Summary of genotype uncertainty for Pt sequences
+
+```{r}
+# summarize (un)certainty across windows
+(pt_uncertainty_summary <- overlap_dat %>% 
+  group_by(seq1, type, geno) %>% 
+  tally() %>% 
+  mutate(ref = ifelse(grepl('Pt', seq1), 'No', 'Yes')) %>% 
+  mutate(type = factor(type, levels = rev(c('Only reference sequences', 'Pt2 sequence included as genotype 8')),
+                       labels = rev(c('Only reference\nsequences', 'Pt2 sequence included\nas genotype 8')))) %>%
+  group_by(seq1) %>% 
+  mutate(n_type = n_distinct(type)) %>% 
+  ggplot(aes(y = type, x = n, fill = geno)) +
+  facet_grid(seq1~., scales = 'free', space = 'free') +
+  geom_col(width = 0.5) +
+  geom_text(aes(label = seq1, y = n_type + 0.75), x = -5, size = 3, check_overlap = TRUE, hjust = 0) +
+  scale_fill_manual(values = c('deepskyblue3', 'red3', 'grey40', 'lightgrey')) +
+  coord_cartesian(clip = 'off') +
+  theme(panel.spacing.y = unit(1, 'lines'),
+        strip.text.y = element_blank()) +
+  labs(x = 'Number of windows', y = '', fill = 'Most closely\nrelated genotype'))
+```
+
+Proportion of windows that fell into each genotype category (a certain genotype or uncertain): 
+
+```{r}
+overlap_dat %>% 
+  group_by(seq1, type, geno) %>% 
+  tally() %>% 
+  group_by(seq1, type) %>% 
+  mutate(tot = sum(n),
+         prop = n/tot)
+```
+
+### Summary of genotype uncertainty for reference sequences (and comparison to Pt sequences)
+
+```{r}
+# NOTE THIS SECTION TAKES A LONG TIME TO RUN
+
+# subset window distance data to only the sequences we want for this analysis
+window_dists_sub <- window_dists %>% 
+  filter(!grepl('Pt', seq1) & !grepl('Pt', seq2) & 
+           pair_type != 'Same genotype, unknown subtype' & pair_type != 'Within subtype')
+
+# sequence ids to use (1 of each subtype)
+seq_ids <- seq_info %>% 
+  filter(subtype != '') %>% 
+  group_by(genotype, subtype) %>% 
+  slice_head(n = 1) %>% 
+  pull(id)
+
+# don't include genotypes with only one subtype for the rm subtype analysis
+seq_ids_no58 <- seq_info %>% 
+  filter(subtype != '' & !genotype %in% c(5, 8)) %>% 
+  group_by(genotype, subtype) %>% 
+  slice_head(n = 1) %>% 
+  pull(id)
+
+# get overlap for reference sequence baseline, excluding a given reference
+ref_overlap_rmref <- lapply(seq_ids, function(x){
+  # print(x) # uncomment this if you want to see your progress
+  window_dists_sub %>% 
+    filter(seq1 != x & seq2 != x) %>% 
+    group_by(pos, pair_type) %>% 
+    summarize(dists = list(dist)) %>% 
+    pivot_wider(names_from = pair_type, values_from = dists) %>% 
+    rowwise() %>% 
+    mutate(ref_overlap = overlap(list(unlist(`Between genotype`), unlist(`Between subtype`)), type = '2', boundaries = c(0, 1))$OV) %>% 
+    ungroup() %>% 
+    select(pos, ref_overlap) %>% 
+     mutate(seq1 = x)
+}) %>% bind_rows() %>% suppressMessages()
+
+# get overlap for reference sequences, excluding sequences of the same genotype
+ref_overlap_rmgeno <- lapply(seq_ids, function(x){
+   # print(x) # uncomment this if you want to see your progress
+   window_dists %>%
+    filter(seq1 == x & genotype_seq1 != genotype_seq2) %>% 
+    get_overlap()
+}) %>% bind_rows() %>% suppressMessages()
+
+# get overlap for reference sequences, excluding sequences of the same subtype
+ref_overlap_rmsubt <- lapply(seq_ids_no58, function(x){
+   # print(x) # uncomment this if you want to see your progress
+   window_dists %>%
+    filter(seq1 == x & !(genotype_seq1 == genotype_seq2 & subtype_seq1 == subtype_seq2)) %>% 
+    get_overlap()
+}) %>% bind_rows() %>% suppressMessages()
+```
+
+```{r}
+# plot summary of uncertainty across genome for patients and references
+pt_overlap_summary <- overlap_dat %>% 
+  mutate(genotype = seq1) %>% 
+  mutate(under_thresh = overlap < ref_overlap) %>% 
+  group_by(seq1, type, genotype) %>% 
+  summarize(prop_uncertain = mean(!under_thresh)) %>% 
+  mutate(type = factor(type, levels = (c('Only reference sequences', 'Pt2 sequence included as genotype 8')),
+                       labels = (c('Only reference\nsequences', 'Pt2 sequence included\nas genotype 8')))) 
+
+pt_colors <- c(Pt1='grey60', Pt2='grey45', Pt3='grey10')
+
+ref_overlap_summary <- ref_overlap_rmgeno %>% mutate(type = 'New\ngenotype') %>% 
+  bind_rows(ref_overlap_rmsubt %>% mutate(type = 'Existing\ngenotype')) %>% 
+  left_join(ref_overlap_rmref) %>% 
+  left_join(seq_info, by = c(seq1 = 'id')) %>% 
+  mutate(under_thresh = overlap < ref_overlap) %>% 
+  group_by(seq1, type, genotype) %>% 
+  summarize(prop_uncertain = mean(!under_thresh)) %>% 
+  mutate(type = factor(type, levels = c('Pt', 'Existing\ngenotype', 'New\ngenotype')))
+
+(compare_uncertainty <- ref_overlap_summary %>% 
+  ggplot(aes(x = type, y = prop_uncertain)) +
+  geom_point(data = pt_overlap_summary, aes(y = prop_uncertain, shape = type, col = genotype), x = 1, size = 2.5) +
+  geom_text(data = pt_overlap_summary %>% 
+              group_by(genotype) %>% summarize(prop_uncertain = mean(prop_uncertain)), 
+            aes(y = prop_uncertain, label = genotype, col = genotype), x = 0.65, check_overlap = TRUE, show.legend = FALSE) +
+  geom_boxplot(alpha = 0, width = 0.5) +
+  geom_jitter(aes(col = genotype), alpha = 0.5, size = 1.5, width = 0.25) +
+  scale_color_manual(values = c(genotype_colors, pt_colors), breaks = 1:8) +
+  scale_shape_manual(values = c(19, 8)) +
+  scale_x_discrete(drop = FALSE) +
+  guides(col = guide_legend(order = 1, override.aes = list(size = 1.5), ncol = 2)) +
+  labs(x = '', y = 'Proportion of windows with\nuncertain genotype classification', col = 'Reference\ngenotype', shape = 'Pt comparison') +
+    theme(axis.title.x = element_blank()))
+```
+
+IQR of proportion of windows with uncertain genotype for reference sequences:
+
+```{r}
+ref_overlap_summary %>% 
+  group_by(type) %>% 
+  summarize(q25 = quantile(prop_uncertain, 0.25),
+            q75 = quantile(prop_uncertain, 0.75))
+```
+
+```{r}
+# save plots
+ggsave(plot = plot_grid(plot_grid(plot_grid(NULL, dists_plot, NULL, ncol = 1, rel_heights = c(1, 21, 1)),
+                        window500_plot,
+                        rel_widths = c(1.2,2), nrow = 1,
+                        labels = 'AUTO'),
+                        plot_grid(NULL, pt_uncertainty_summary, NULL, compare_uncertainty, NULL, 
+                                  nrow = 1, labels = c('', 'C', '', 'D', ''), rel_widths = c(2.5, 12, 1, 10, 2.5)), rel_heights = c(1.5, 1),
+                        ncol = 1), filename = 'figures/hamming_dists.pdf',
+       width = 13, height = 7.5, dpi = 300)
+
+ggsave(plot = plot_grid(overlap_plot, labels = paste('A', str_c(rep('\t', 62), collapse = ''), 'B')), filename = 'figures/overlap.pdf', width = 9, height = 5, dpi = 300)
+```
+
+
