@@ -4,7 +4,9 @@ execute:
   echo: false
   message: false
   warning: false
-format: html
+format: 
+  html:
+    embed-resources: true
 ---
 
 ```{r}
