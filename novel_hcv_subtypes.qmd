@@ -13,7 +13,6 @@ format:
 # load libraries
 library(ape)
 library(tidyverse)
-library(igraph)
 library(ggtree)
 library(treeio)
 library(cowplot)
@@ -45,7 +44,7 @@ aln <- read.FASTA("data/hcv+ref.mafft.FFT-NS-i.trimends.fasta")
 # get sequence information
 seq_info <- names(aln) %>% 
   enframe(value = 'id') %>% 
-  separate(id, sep = '_', into = c('genotype_subtype', 'unique_id'), remove = FALSE, ) %>% 
+  separate(id, sep = '_', into = c('genotype_subtype', 'unique_id'), remove = FALSE) %>% 
   mutate(genotype_subtype = ifelse(grepl('Pt', genotype_subtype), NA, genotype_subtype),
          # call genotype 4? genotype 4
          genotype = gsub('[a-z]|\\?', '', genotype_subtype),
@@ -71,11 +70,21 @@ tr <- read.iqtree('data/hcv+ref.PhyML.gtrig.trim.tree') %>%
 #'
 #' @return Data frame with columns: seq1, seq2, dist, genotype_seq1, subtype_seq1, genotype_seq2, subtype_seq2, pair_type
 compute_hamming_dists <- function(aln, mode, seq_info){
-  # calculate pairwise genetic distances (normalized hamming, substitutions/site) and convert to long format
-  dist.dna(aln, model = "raw", pairwise.deletion = TRUE, as.matrix = TRUE) %>%
-    graph.adjacency(mode = mode, weighted = TRUE) %>% 
-    get.data.frame() %>% 
-    rename(seq1 = from, seq2 = to, dist = weight) %>% 
+  # calculate pairwise genetic distances (normalized hamming, substitutions/site) 
+  distmat <- dist.dna(aln, model = "raw", pairwise.deletion = TRUE, as.matrix = TRUE) 
+  # don't want pairwise distance with itself
+  diag(distmat) <- NA
+  if(mode == 'undirected'){
+    # only want one of each pair
+    distmat[lower.tri(distmat)] <- NA
+  }
+  # convert to long format
+  distmat %>%
+    as.table() %>% 
+    data.frame() %>% 
+    rename(seq1 = Var1, seq2 = Var2, dist = Freq) %>%
+    # remove distances that are NA
+    drop_na(dist) %>% 
     # add in sequence information
     left_join(seq_info %>% rename(seq1 = id, genotype_seq1 = genotype, subtype_seq1 = subtype), by = 'seq1') %>% 
     left_join(seq_info %>% rename(seq2 = id, genotype_seq2 = genotype, subtype_seq2 = subtype), by = 'seq2') %>% 
@@ -151,7 +160,8 @@ ggsave(plot = tr_plot, filename = 'figures/full_tr.pdf', width = 7, height = 7, 
 ```{r}
 # calculate whole genome distances
 # undirected because we don't want pairs showing up twice in the distributions
-dists_whole_genome <- compute_hamming_dists(aln, mode = 'undirected', seq_info = seq_info)
+dists_whole_genome <- compute_hamming_dists(aln, mode = 'undirected', seq_info = seq_info) 
+  
 
 # get information about between patient pairs and prep data for plotting
 btwn_pt_dists <- dists_whole_genome %>% filter(pair_type == 'Between Pt') %>% 
