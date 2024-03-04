@@ -54,10 +54,13 @@ seq_info <- names(aln) %>%
 
 # read in tree
 tr <- read.iqtree('data/hcv+ref.PhyML.gtrig.trim.tree') %>% 
-  mutate(lab = ifelse(grepl('Pt', label), label, NA),
-         node_lab = ifelse(node %in% c(347:349, 353, 354), ifelse(SH_aLRT == 1, '*', NA), NA)) %>% 
+  mutate(# patient labels
+         lab = ifelse(grepl('Pt', label), label, NA),
+         # parent nodes of Pt sequences, and nodes adjacent to each Pt sequence
+         node_lab = ifelse(node %in% c(347:350, 353, 354), ifelse(SH_aLRT == 1, '*', NA), NA)) %>% 
   left_join(seq_info %>% rename(label = id), by = 'label')
 ```
+
 
 ```{r}
 # Functions. see example input for functions in code below
@@ -139,8 +142,8 @@ mrcas <- sapply(1:8, function(g){
   ggtree(aes(col = group), layout = 'equal_angle') +
     # label branches of interest that have high branch support and add text
     geom_nodelab(aes(label = node_lab),
-                 nudge_x = c(0.02, 0.02, 0, 0, 0), nudge_y = c(0, 0, 0.002, -0.025, 0.0), # this throws a warning but it works
-                 show.legend = FALSE)  +
+                 nudge_x = c(0.02, 0.02, 0, 0, 0), nudge_y = c(0, 0, -0.025, -0.025, -0.03), # this throws a warning but it works
+                 show.legend = FALSE) +
     geom_text(label = '*aLRT = 1', x = 0.3, y = -0.65, col = 'grey50', check_overlap = TRUE)+
     # label sequences of interest
     geom_tiplab(aes(label = lab), offset = -0.01, size = 3, vjust = 0.2, col = 'black', show.legend = FALSE) +
